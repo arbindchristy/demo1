@@ -1,0 +1,133 @@
+import argparse, re, subprocess, sys, time
+
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+REPOS = {"FT": r"g:\git-repo\FT\Esnaad",
+         "UAT": r"g:\git-repo\UAT\Esnaad",
+         "Hotfix": r"g:\git-repo\Hotfix\Esnaad"}
+STALE_DAYS = 21
+RX = [re.compile(p, re.I) for p in (
+    r'(?:TABLE|VIEW|PROC(?:EDURE)?|FUNCTION)\s+\[?(?:\w+\]?\.\[?)?(\w+)',
+    r'table\s*=\s*"(?:\w+\.)?(\w+)"',
+    r'Table\(\s*"(?:\w+\.)?(\w+)"')]
+
+
+def run(repo, *a, raw=False):
+    r = subprocess.run(["git", "-C", repo, "-c", "core.quotepath=false", *a],
+                       capture_output=True)
+    out = r.stdout if r.returncode == 0 else b""
+    return out if raw else out.decode("utf-8", "replace")
+
+
+def fetch(repo):
+    r = subprocess.run(["git", "-C", repo, "fetch", "--all", "--prune", "--quiet"],
+                       capture_output=True)
+    if r.returncode:
+        print("WARNING: git fetch failed in", repo)
+    return r.returncode == 0
+
+
+def upstream(repo):
+    return run(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}").strip()
+
+
+def ok(repo, ref):
+    return bool(ref) and bool(run(repo, "rev-parse", "--verify", "--quiet", ref + "^{commit}").strip())
+
+
+def age(repo, ref):
+    t = run(repo, "log", "-1", "--format=%ct", ref).strip()
+    return int((time.time() - int(t)) / 86400) if t.isdigit() else None
+
+
+def objs(path, text):
+    p = path.lower()
+    if p.endswith(".sql"):
+        rx = RX[:1]
+    elif p.endswith(".hbm.xml") or p.endswith("map.cs"):
+        rx = RX[1:]
+    else:
+        return set()
+    return {m for r in rx for m in r.findall(text) if len(m) > 2}
+
+
+def users(repo, ref, term, skip):
+    out = run(repo, "grep", "-l", "-i", "-w", term, ref, "--").splitlines()
+    names = [l.split(":", 1)[1] for l in out if ":" in l]
+    return [n for n in names if n not in skip][:15]
+
+
+def rpt_hits(repo, ref, names):
+    hits = {n: [] for n in names}
+    if not names:
+        return hits
+    for f in run(repo, "ls-tree", "-r", "--name-only", ref).splitlines():
+        if not f.lower().endswith(".rpt"):
+            continue
+        data = run(repo, "show", ref + ":" + f, raw=True).lower()
+        for n in names:
+            if n.lower().encode() in data or n.lower().encode("utf-16-le") in data:
+                hits[n].append(f)
+    return hits
+
+
+def impact(name, head):
+    repo = REPOS[name]
+    fetch(repo)
+    base = upstream(repo)
+    head = head or "HEAD"
+    for ref in (base, head):
+        if not ok(repo, ref):
+            sys.exit("Branch not found: %r (no upstream? try: git branch -u origin/<branch>)" % ref)
+    d = age(repo, base)
+    print("# %s: %s vs %s (base last commit %s days ago)" % (name, head, base, d))
+    if d is not None and d > STALE_DAYS:
+        print("WARNING: base branch is old. Is the %s folder on the current sprint branch?" % name)
+    rows = [l.split("\t") for l in run(repo, "diff", "--name-status", base + "..." + head).splitlines()]
+    files = [(r[0][0], r[-1]) for r in rows if len(r) > 1]
+    if not files:
+        print("No changes.")
+        return
+    names = set()
+    print("\n## Changed files")
+    for st, p in files:
+        print(st, p)
+        names |= objs(p, run(repo, "show", head + ":" + p))
+    skip = {p for _, p in files}
+    print("\n## Tables/views/procs touched -> other files using them")
+    for n in sorted(names):
+        print("-", n, "->", ", ".join(users(repo, head, n, skip)) or "none found")
+    print("\n## Crystal reports that may use them")
+    for n, fs in rpt_hits(repo, head, names).items():
+        if fs:
+            print("-", n, "->", ", ".join(fs))
+    if any(p.lower().endswith(".rpt") for _, p in files):
+        print("NOTE: .rpt files changed. Open them in Crystal and run Verify Database.")
+
+
+def gate():
+    uat, hot = REPOS["UAT"], REPOS["Hotfix"]
+    fresh = fetch(uat)
+    ub, hb = upstream(uat), upstream(hot)
+    for ref in (ub, hb):
+        if not ok(uat, ref):
+            sys.exit("BLOCK: cannot resolve branch %r" % ref)
+    miss = run(uat, "log", "--no-merges", "--cherry-pick", "--right-only",
+               "--format=%h %an %s", ub + "..." + hb).strip()
+    print("# Gate: Hotfix %s vs UAT %s" % (hb, ub))
+    if miss:
+        print("Hotfix commits NOT in UAT:\n" + miss)
+    if miss or not fresh:
+        sys.exit("BLOCK" + ("" if fresh else " (fetch failed, data may be stale)"))
+    print("CLEAR to release")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cmd", choices=["FT", "UAT", "Hotfix", "gate"])
+    ap.add_argument("head", nargs="?", help="branch under review, e.g. origin/feature/abc")
+    a = ap.parse_args()
+    if a.cmd == "gate":
+        gate()
+    else:
+        impact(a.cmd, a.head)
